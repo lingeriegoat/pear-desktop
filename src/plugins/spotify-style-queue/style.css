@@ -1,0 +1,307 @@
+/* We no longer need the native queue visually laid out for thumbnails —
+   those are read from each item's underlying JS data instead of depending
+   on native rendering/lazy-loading. But the native menu button still needs
+   a real (non-zero) position for its own popup to anchor correctly when we
+   forward a click to it, so this stays laid out — just invisible and
+   click-through — rather than display:none. */
+#side-panel.ssq-active > tp-yt-paper-tabs.tab-header-container,
+#side-panel.ssq-active ytmusic-queue-header-renderer,
+#side-panel.ssq-active tp-yt-paper-spinner-lite {
+  display: none !important;
+}
+
+#side-panel.ssq-active ytmusic-tab-renderer#tab-renderer {
+  position: relative;
+  /* This element ships with YouTube's own "scroller" class, making it a
+     second, independent scrolling container layered with our own
+     .ssq-panel below. When our panel's height didn't perfectly constrain
+     itself, THIS outer element ended up being the one that actually
+     scrolled — meaning any scroll-position fixes aimed at .ssq-panel were
+     silently doing nothing, since it was never the element actually
+     moving. Force it to never scroll itself, so .ssq-panel is the only
+     scrolling context that exists. */
+  overflow: hidden !important;
+  overflow-anchor: none;
+}
+
+#side-panel.ssq-active ytmusic-player-queue {
+  position: absolute;
+  inset: 0;
+  visibility: hidden;
+  pointer-events: none;
+}
+
+/* The native list never removes already-played tracks — it just leaves
+   them marked unselected and keeps growing as autoplay appends more, so
+   over a long session this can accumulate into hundreds of fairly heavy
+   elements. Giving all of them real layout at all times gets expensive to
+   reflow and was causing a visible blank-frame jank on updates once the
+   list grew large. content-visibility:hidden skips layout entirely (much
+   cheaper than just invisible) — the one item actually being interacted
+   with gets temporarily promoted back to normal by JS right when its menu
+   button is clicked, since that's the only case an item needs a real
+   on-screen position (for the popup to anchor to). */
+#side-panel.ssq-active ytmusic-player-queue-item {
+  content-visibility: hidden;
+}
+
+.ssq-tabbar {
+  display: flex;
+  align-items: center;
+  gap: 24px;
+  padding: 16px 12px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+  box-sizing: border-box;
+  /* Left offset and width are set inline via JS (syncPanelRect) to stay in
+     lockstep with the panel's own position, whichever alignment is chosen —
+     plain CSS centering here doesn't work since this element is only ever
+     as wide as its own content otherwise. */
+}
+
+.ssq-align-toggle {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--yt-spec-text-secondary, #aaaaaa);
+  cursor: pointer;
+}
+
+.ssq-align-toggle:hover {
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.ssq-tab {
+  background: none;
+  border: none;
+  color: var(--yt-spec-text-secondary, #aaaaaa);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  padding: 4px 0 10px;
+  cursor: pointer;
+  position: relative;
+}
+
+.ssq-tab:hover {
+  color: #ffffff;
+}
+
+.ssq-tab.is-active {
+  color: #ffffff;
+}
+
+.ssq-tab.is-active::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 2px;
+  background: #ffffff;
+  border-radius: 2px;
+}
+
+.ssq-panel {
+  /* position:fixed rather than absolute — an absolutely-positioned element
+     is anchored to its ancestor's padding box, which is part of that
+     ancestor's own scrollable content. YTM's own "scroll the currently
+     playing item into view" behavior (standard queue UX) is still active
+     on the native #tab-renderer underneath (which stays present in the
+     DOM, just invisible) and was dragging this panel along with it every
+     time it scrolled that into view, then our own scroll-reset snapped it
+     back a moment later — that whole sequence was the visible blanking.
+     Fixed positioning is anchored to the real viewport instead, so no
+     ancestor's scroll offset can move it. Its exact rect is synced to
+     #tab-renderer's own bounding box in JS on each render (that box itself
+     doesn't move due to the element's *own* internal scrolling, only an
+     ancestor's would move it, and none of ours do). */
+  position: fixed;
+  /* Below the player bar (confirmed at z-index:4) so it keeps covering the
+     bottom strip the way it always did — #tab-renderer's own bounding box
+     extends behind where the player bar sits (the content area fills that
+     space in normal layout; the player bar is a separate overlay on top of
+     it), so our panel needs the same "underneath the player bar" stacking
+     to avoid painting over it. Still low enough to sit below the native
+     menu popup (confirmed at z-index:103) so that keeps rendering on top
+     of this panel too. */
+  z-index: 2;
+  overflow-y: auto;
+  padding-bottom: 24px;
+  background: var(--yt-spec-base-background, #030303);
+  /* The row list is fully re-rendered on every update (including a
+     periodic poll), which can trigger the browser's automatic scroll-
+     anchoring adjustments to drift the scroll position over a long
+     session. There's never a good reason for anything to auto-scroll
+     this panel, so opt out entirely. */
+  overflow-anchor: none;
+}
+
+.ssq-list {
+  overflow-anchor: none;
+}
+
+.ssq-view {
+  display: none;
+}
+
+.ssq-view.is-active {
+  display: block;
+}
+
+/* Now playing */
+.ssq-now-playing-label {
+  padding: 16px 12px 0;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--yt-spec-text-secondary, #aaaaaa);
+  letter-spacing: 0.04em;
+}
+
+.ssq-now-playing {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 12px 16px;
+}
+
+.ssq-now-playing.is-empty {
+  display: none;
+}
+
+.ssq-now-playing-art,
+.ssq-row-art {
+  flex-shrink: 0;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--yt-spec-black-1, #282828);
+}
+
+.ssq-now-playing-art {
+  width: 56px;
+  height: 56px;
+}
+
+.ssq-row-art {
+  width: 40px;
+  height: 40px;
+}
+
+.ssq-now-playing-art img,
+.ssq-row-art img,
+.ssq-art-fallback {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.ssq-now-playing-info,
+.ssq-row-info {
+  min-width: 0;
+  flex: 1;
+}
+
+.ssq-now-playing-title {
+  color: #1ed760;
+  font-size: 14px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ssq-now-playing-artist,
+.ssq-row-artist {
+  color: var(--yt-spec-text-secondary, #aaaaaa);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+
+.ssq-section-label {
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--yt-spec-text-secondary, #aaaaaa);
+  letter-spacing: 0.04em;
+}
+
+.ssq-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.ssq-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.ssq-row:hover {
+  background: var(--yt-spec-black-1, #282828);
+}
+
+.ssq-row-title {
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ssq-row-duration {
+  flex-shrink: 0;
+  color: var(--yt-spec-text-secondary, #aaaaaa);
+  font-size: 12px;
+  padding-left: 8px;
+}
+
+.ssq-row:hover .ssq-row-duration,
+.ssq-now-playing:hover .ssq-row-duration {
+  display: none;
+}
+
+.ssq-row-menu {
+  display: none;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: #ffffff;
+  cursor: pointer;
+}
+
+.ssq-row-menu:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.ssq-row:hover .ssq-row-menu,
+.ssq-now-playing:hover .ssq-row-menu {
+  display: flex;
+}
+
+.ssq-empty {
+  padding: 24px 16px;
+  color: var(--yt-spec-text-secondary, #aaaaaa);
+  font-size: 13px;
+  line-height: 1.4;
+}

@@ -9,6 +9,7 @@ import { getSongInfo } from '@/providers/song-info-front';
 import { createBlockButton } from './templates/block-button';
 
 import type { BlockedArtist, BlocklistPluginConfig } from './index';
+import { sortBlockedArtists } from './sort';
 import type { RendererContext } from '@/types/contexts';
 import type { MusicPlayer } from '@/types/music-player';
 import type { VideoDataChangeValue } from '@/types/player-api-events';
@@ -107,7 +108,45 @@ const onVideoDataChange = (
   skipIfBlocked(data?.author, data?.videoId);
 };
 
-/* ---- resolving which artist(s) a menu targets ---- */
+
+type PendingQueueRow = { byline: string; capturedAt: number };
+let pendingQueueRow: PendingQueueRow | null = null;
+const PENDING_QUEUE_ROW_TTL_MS = 4000;
+
+const captureQueueRowFromEventTarget = (target: EventTarget | null) => {
+  const menuRenderer = (target as HTMLElement | null)?.closest<HTMLElement>(
+    'ytmusic-menu-renderer',
+  );
+  const row = menuRenderer?.closest<HTMLElement>('ytmusic-player-queue-item');
+  if (!row) {
+    pendingQueueRow = null;
+    return;
+  }
+
+  const byline = row
+    .querySelector<HTMLElement>('.byline')
+    ?.textContent?.trim();
+  pendingQueueRow = byline ? { byline, capturedAt: Date.now() } : null;
+};
+
+const onQueueRowPointerDown = (event: Event) =>
+  captureQueueRowFromEventTarget(event.target);
+
+const onQueueRowKeyDown = (event: KeyboardEvent) => {
+  if (event.key === 'Enter' || event.key === ' ') {
+    captureQueueRowFromEventTarget(event.target);
+  }
+};
+
+const getFreshQueueRowArtistNames = (): string[] => {
+  if (!pendingQueueRow) return [];
+  if (Date.now() - pendingQueueRow.capturedAt > PENDING_QUEUE_ROW_TTL_MS) {
+    pendingQueueRow = null;
+    return [];
+  }
+  return splitArtists(pendingQueueRow.byline);
+};
+
 
 const dedupeArtists = (artists: BlockedArtist[]): BlockedArtist[] => {
   const seen = new Set<string>();
@@ -121,11 +160,6 @@ const dedupeArtists = (artists: BlockedArtist[]): BlockedArtist[] => {
   return result;
 };
 
-// Resolve an artist's display name from its channel id. A menu item's own
-// text is the action label ("Go to artist"), never the artist name, so read
-// the name from a link to that same channel on the underlying page (the song
-// row or artist card that opened the menu). Links inside the popup are skipped
-// so we don't read the "Go to artist" label back as the name.
 const resolveArtistName = (channelId: string): string | undefined => {
   for (const link of document.querySelectorAll<HTMLAnchorElement>(
     `a[href*="${channelId}"]`,
@@ -137,23 +171,43 @@ const resolveArtistName = (channelId: string): string | undefined => {
   return undefined;
 };
 
-// "Go to artist" links inside the open popup menu (works for song rows).
+
 const getMenuLinkedArtists = (menu: HTMLElement): BlockedArtist[] => {
-  const artists: BlockedArtist[] = [];
+  const channelIds: string[] = [];
   for (const item of menu.querySelectorAll<HTMLElement>(
     'ytmusic-menu-navigation-item-renderer',
   )) {
     const channelId = parseChannelId(
       item.querySelector('#navigation-endpoint')?.getAttribute('href'),
     );
-    if (!channelId) continue;
-    const name = resolveArtistName(channelId);
-    if (name) artists.push({ name, channelId });
+    if (channelId) channelIds.push(channelId);
   }
-  return artists;
+  if (!channelIds.length) return [];
+
+  const resolvedNames = channelIds.map(resolveArtistName);
+  if (resolvedNames.every((name): name is string => !!name)) {
+    return channelIds.map((channelId, i) => ({
+      name: resolvedNames[i]!,
+      channelId,
+    }));
+  }
+
+  const rowNames = getFreshQueueRowArtistNames();
+  if (rowNames.length === channelIds.length) {
+    return channelIds.map((channelId, i) => ({
+      name: rowNames[i],
+      channelId,
+    }));
+  }
+  if (channelIds.length === 1 && rowNames.length >= 1) {
+    return [{ name: pendingQueueRow!.byline, channelId: channelIds[0] }];
+  }
+
+  return channelIds
+    .map((channelId, i) => ({ name: resolvedNames[i], channelId }))
+    .filter((artist): artist is BlockedArtist => !!artist.name);
 };
 
-// Every artist listed in the now-playing bar byline (full multi-artist list).
 const getPlayerBarArtists = (): BlockedArtist[] => {
   const artists: BlockedArtist[] = [];
   for (const link of document.querySelectorAll<HTMLAnchorElement>(
@@ -167,17 +221,14 @@ const getPlayerBarArtists = (): BlockedArtist[] => {
 };
 
 const getMenuArtists = (menu: HTMLElement): BlockedArtist[] => {
-  // The now-playing bar menu exposes the full artist list via the byline.
   if (isPlayerMenu(menu)) {
     const byline = getPlayerBarArtists();
     if (byline.length) return dedupeArtists(byline);
   }
 
-  // Any menu with "Go to artist" links (song rows, player bar, …).
   const linked = getMenuLinkedArtists(menu);
   if (linked.length) return dedupeArtists(linked);
 
-  // A track menu with no artist link — fall back to the current song's artist.
   if (isMusicOrVideoTrack() || isPlayerMenu(menu)) {
     const info = getSongInfo();
     if (info?.artist) {
@@ -188,16 +239,17 @@ const getMenuArtists = (menu: HTMLElement): BlockedArtist[] => {
   return [];
 };
 
-/* ---- blocking + menu injection ---- */
 
 const blockArtist = (artist: BlockedArtist) => {
   if (!isBlocked(artist.name)) {
-    const blockedArtists = [...config.blockedArtists, artist];
+    const blockedArtists = sortBlockedArtists([
+      ...config.blockedArtists,
+      artist,
+    ]);
     config = { ...config, blockedArtists };
     setConfig({ blockedArtists });
   }
 
-  // Close the popup, then skip the current song if it is now blocked.
   document
     .querySelector<HTMLElement & { close?: () => void }>(
       'ytmusic-popup-container tp-yt-iron-dropdown',
@@ -245,6 +297,10 @@ export const onRendererLoad = async (
 ) => {
   setConfig = context.setConfig;
   config = await context.getConfig();
+
+  document.addEventListener('pointerdown', onQueueRowPointerDown, true);
+  document.addEventListener('click', onQueueRowPointerDown, true);
+  document.addEventListener('keydown', onQueueRowKeyDown, true);
 };
 
 export const onConfigChange = (newConfig: BlocklistPluginConfig) => {
@@ -257,7 +313,6 @@ export const onPlayerApiReady = (
 ) => {
   api = playerApi;
 
-  // A blocked song might already be loaded when the plugin starts.
   const current = getSongInfo();
   skipIfBlocked(current?.artist, current?.videoId);
   playerApi.addEventListener('videodatachange', onVideoDataChange);
@@ -272,6 +327,10 @@ export const stop = () => {
   menuObserver.disconnect();
   recentSkipAttempts.clear();
   lastPlaylistIndex = -1;
+  pendingQueueRow = null;
+  document.removeEventListener('pointerdown', onQueueRowPointerDown, true);
+  document.removeEventListener('click', onQueueRowPointerDown, true);
+  document.removeEventListener('keydown', onQueueRowKeyDown, true);
   api?.removeEventListener('videodatachange', onVideoDataChange);
   getSongMenu()
     ?.querySelectorAll('.blocklist-injected')

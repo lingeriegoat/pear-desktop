@@ -1,9 +1,11 @@
+import { dialog } from 'electron';
 import prompt from 'custom-electron-prompt';
 
 import { t } from '@/i18n';
 import promptOptions from '@/providers/prompt-options';
 
 import type { BlocklistPluginConfig } from './index';
+import { sortBlockedArtists } from './sort';
 import type { MenuTemplate } from '@/menu';
 import type { MenuContext } from '@/types/contexts';
 
@@ -40,7 +42,10 @@ export const onMenu = async ({
         if (alreadyBlocked) return;
 
         setConfig({
-          blockedArtists: [...config.blockedArtists, { name: trimmed }],
+          blockedArtists: sortBlockedArtists([
+            ...config.blockedArtists,
+            { name: trimmed },
+          ]),
         });
         await refresh();
       },
@@ -49,10 +54,19 @@ export const onMenu = async ({
   ];
 
   if (config.blockedArtists.length === 0) {
-    template.push({
-      label: t('plugins.blocklist.menu.no-artists'),
-      enabled: false,
-    });
+    template.push(
+      {
+        label: t('plugins.blocklist.menu.no-artists'),
+        enabled: false,
+      },
+      { type: 'separator' },
+      {
+        label: t('plugins.blocklist.menu.refresh'),
+        click() {
+          refresh();
+        },
+      },
+    );
     return template;
   }
 
@@ -78,8 +92,31 @@ export const onMenu = async ({
   template.push(
     { type: 'separator' },
     {
-      label: t('plugins.blocklist.menu.clear'),
+      label: t('plugins.blocklist.menu.refresh'),
       click() {
+        refresh();
+      },
+    },
+    { type: 'separator' },
+    {
+      label: t('plugins.blocklist.menu.clear'),
+      async click() {
+        const artistCount = config.blockedArtists.length;
+        const { response } = await dialog.showMessageBox(window, {
+          type: 'warning',
+          buttons: [
+            t('plugins.blocklist.menu.clear-confirm.yes'),
+            t('plugins.blocklist.menu.clear-confirm.no'),
+          ],
+          defaultId: 1,
+          cancelId: 1,
+          title: t('plugins.blocklist.menu.clear-confirm.title'),
+          message: t('plugins.blocklist.menu.clear-confirm.message', {
+            count: artistCount,
+          }),
+        });
+        if (response !== 0) return;
+
         setConfig({ blockedArtists: [] });
         refresh();
       },
