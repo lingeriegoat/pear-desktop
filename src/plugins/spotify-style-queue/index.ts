@@ -19,6 +19,13 @@ type QueueTrack = {
   thumbnail: string;
   duration: string;
   isCurrent: boolean;
+  // Position within the full `tracks` array this track was built from.
+  // Set once in collectTracks so later lookups (row datasets, "who is
+  // this the same track as") never need an indexOf() scan.
+  index: number;
+  // Stable identity for caching/dedup — prefers the real video ID, falls
+  // back to title+artist when no ID could be read off the element.
+  key: string;
 };
 
 const SELECTORS = {
@@ -92,6 +99,55 @@ function extractThumbnailUrl(el: HTMLElement): string {
   return '';
 }
 
+// Same rationale as extractThumbnailUrl: read the real video ID off the
+// bound Polymer data instead of the DOM. Used as a stable cache/identity
+// key — title+artist text alone collides for genuine duplicates (a track
+// queued twice, a live vs. studio version with identical byline text),
+// which let one track's cached thumbnail leak onto an unrelated one and
+// could confuse "same row's menu clicked again" detection.
+function extractTrackId(el: HTMLElement): string {
+  const candidates: unknown[] = [
+    (el as any).data,
+    (el as any).__data?.data,
+    (el as any).__data,
+  ];
+
+  for (const data of candidates) {
+    const id =
+      (data as any)?.videoId ||
+      (data as any)?.playlistPanelVideoRenderer?.videoId ||
+      (data as any)?.watchEndpoint?.videoId ||
+      (data as any)?.navigationEndpoint?.watchEndpoint?.videoId;
+    if (typeof id === 'string' && id) return id;
+  }
+
+  return '';
+}
+
+// Cheap guard against unbounded growth over a very long session — unlike
+// maxRecentlyPlayed this cache has no natural cap, since it never forgets
+// a track just because it scrolled out of the recently-played window.
+const MAX_THUMBNAIL_CACHE_ENTRIES = 500;
+
+function cacheThumbnail(
+  cache: Map<string, string>,
+  key: string,
+  url: string,
+) {
+  cache.set(key, url);
+  if (cache.size > MAX_THUMBNAIL_CACHE_ENTRIES) {
+    // Map preserves insertion order, so the front of the iterator is the
+    // oldest entries — evict just enough to get back under the cap.
+    const excess = cache.size - MAX_THUMBNAIL_CACHE_ENTRIES;
+    const it = cache.keys();
+    for (let i = 0; i < excess; i++) {
+      const k = it.next().value;
+      if (k === undefined) break;
+      cache.delete(k);
+    }
+  }
+}
+
 function collectTracks(
   contents: HTMLElement,
   thumbnailCache: Map<string, string>,
@@ -105,15 +161,16 @@ function collectTracks(
     return true;
   });
 
-  return items.map((el) => {
+  return items.map((el, index) => {
     const title = textOf(el.querySelector('.song-title'));
     const artist = textOf(el.querySelector('.byline'));
-    const key = `${title}\u241F${artist}`;
+    const trackId = extractTrackId(el);
+    const key = trackId || `${title}\u241F${artist}`;
 
     let thumbnail = thumbnailCache.get(key) || '';
     if (!thumbnail) {
       thumbnail = extractThumbnailUrl(el);
-      if (thumbnail) thumbnailCache.set(key, thumbnail);
+      if (thumbnail) cacheThumbnail(thumbnailCache, key, thumbnail);
     }
 
     return {
@@ -123,6 +180,8 @@ function collectTracks(
       duration: textOf(el.querySelector('.duration')),
       thumbnail,
       isCurrent: el.hasAttribute('selected'),
+      index,
+      key,
     };
   });
 }
@@ -165,10 +224,15 @@ function rowHTML(track: QueueTrack, variant: 'current' | 'row'): string {
   `;
 }
 
+// Reused across every call instead of allocating a new element each time —
+// this runs for title/artist/duration on every row, on every render.
+const escapeScratchEl: HTMLDivElement | null =
+  typeof document !== 'undefined' ? document.createElement('div') : null;
+
 function escapeHTML(str: string): string {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+  if (!escapeScratchEl) return str;
+  escapeScratchEl.textContent = str;
+  return escapeScratchEl.innerHTML;
 }
 
 export default createPlugin({
@@ -226,7 +290,6 @@ export default createPlugin({
     tabbarEl: null as HTMLElement | null,
     setConfig: null as ((c: Partial<SpotifyStyleQueueConfig>) => void) | null,
     rectObserver: null as ResizeObserver | null,
-    rectPollInterval: null as number | null,
     queueListEl: null as HTMLElement | null,
     recentListEl: null as HTMLElement | null,
     nowPlayingLabelEl: null as HTMLElement | null,
@@ -239,6 +302,7 @@ export default createPlugin({
     thumbnailCache: new Map<string, string>(),
     renderQueued: false,
     onVideoDataChange: null as ((e: Event) => void) | null,
+    onVisibilityChange: null as (() => void) | null,
     openMenuTrackKey: null as string | null,
 
     async start(context) {
@@ -340,10 +404,10 @@ export default createPlugin({
       this.rectObserver = new ResizeObserver(() => this.syncPanelRect());
       this.rectObserver.observe(tabRenderer);
       this.syncPanelRect();
-      this.rectPollInterval = window.setInterval(
-        () => this.syncPanelRect(),
-        100,
-      );
+      // The dedicated 100ms rect-poll safety net (see comment on
+      // syncPanelRect) is set up below, merged into the same interval as
+      // the render poll — see the single setInterval near the end of
+      // injectUI.
 
       this.nowPlayingLabelEl = panel.querySelector('.ssq-now-playing-label');
       this.nowPlayingEl = panel.querySelector('.ssq-now-playing');
@@ -362,9 +426,7 @@ export default createPlugin({
         const menuIndex = menuRow ? Number(menuRow.dataset.ref) : -1;
         const menuTrack =
           menuIndex >= 0 ? this.lastTracks?.[menuIndex] : undefined;
-        const menuTrackKey = menuTrack
-          ? `${menuTrack.title}\u241F${menuTrack.artist}`
-          : null;
+        const menuTrackKey = menuTrack?.key ?? null;
 
         // Check the real dropdown's own `.opened` state directly rather
         // than mirroring it ourselves — it's the single source of truth
@@ -450,7 +512,31 @@ export default createPlugin({
         }, 150);
       };
       document.addEventListener('videodatachange', this.onVideoDataChange);
-      this.pollInterval = window.setInterval(() => this.scheduleRender(), 1000);
+      // Single 100ms loop covering both jobs that used to be two separate
+      // intervals: the rect-sync safety net (needs the full 100ms
+      // cadence — it's what tracks the shelf through its open/close
+      // animation, a coarser interval visibly lags and leaves stale
+      // remnants during that transition) and the render poll (only
+      // actually needs ~1s cadence, so it just runs on every 10th tick
+      // instead of its own timer). One timer instead of two, same
+      // responsiveness as the original 100ms rect poll. Both legs skip
+      // their work while hidden/backgrounded; onVisibilityChange below
+      // catches everything up the instant it becomes visible again.
+      let tick = 0;
+      this.pollInterval = window.setInterval(() => {
+        if (document.hidden) return;
+        this.syncPanelRect();
+        tick = (tick + 1) % 10;
+        if (tick === 0) this.scheduleRender();
+      }, 100);
+
+      this.onVisibilityChange = () => {
+        if (!document.hidden) {
+          this.syncPanelRect();
+          this.scheduleRender();
+        }
+      };
+      document.addEventListener('visibilitychange', this.onVisibilityChange);
     },
 
     // The real popup is a `<tp-yt-iron-dropdown>` element living inside
@@ -677,7 +763,6 @@ export default createPlugin({
     reconcileRows(
       container: HTMLElement,
       rows: QueueTrack[],
-      fullTracks: QueueTrack[],
       rowMap: Map<HTMLElement, HTMLElement>,
     ) {
       const used = new Set<HTMLElement>();
@@ -698,7 +783,10 @@ export default createPlugin({
           this.rowContentCache.set(row, content);
         }
 
-        const ref = String(fullTracks.indexOf(track));
+        // track.index is set once in collectTracks, so this is O(1) instead
+        // of the O(n) scan indexOf() used to do per row (O(n²) overall,
+        // running on every render — poll included).
+        const ref = String(track.index);
         if (row.dataset.ref !== ref) row.dataset.ref = ref;
 
         const desiredNext: ChildNode | null = prev
@@ -827,7 +915,7 @@ export default createPlugin({
           rowHTML(current, 'current'),
         );
         this.nowPlayingEl.classList.remove('is-empty');
-        this.nowPlayingEl.dataset.ref = String(tracks.indexOf(current));
+        this.nowPlayingEl.dataset.ref = String(current.index);
         this.nowPlayingEl.dataset.current = 'true';
         if (this.nowPlayingLabelEl)
           this.nowPlayingLabelEl.style.display = '';
@@ -840,12 +928,11 @@ export default createPlugin({
           this.nowPlayingLabelEl.style.display = 'none';
       }
 
-      // "Next up" list — indices are relative to the full `tracks` array so
-      // clicks can look the source element back up in lastTracks.
+      // "Next up" list — track.index is relative to the full `tracks`
+      // array so clicks can look the source element back up in lastTracks.
       this.reconcileRows(
         this.queueListEl,
         upcoming,
-        tracks,
         this.queueRowMap,
       );
 
@@ -869,7 +956,6 @@ export default createPlugin({
       this.reconcileRows(
         this.recentListEl,
         recent,
-        tracks,
         this.recentRowMap,
       );
 
@@ -897,10 +983,6 @@ export default createPlugin({
       }
       this.rectObserver?.disconnect();
       this.rectObserver = null;
-      if (this.rectPollInterval !== null) {
-        window.clearInterval(this.rectPollInterval);
-        this.rectPollInterval = null;
-      }
       this.queueRowMap.clear();
       this.recentRowMap.clear();
       if (this.onVideoDataChange) {
@@ -908,6 +990,13 @@ export default createPlugin({
           'videodatachange',
           this.onVideoDataChange,
         );
+      }
+      if (this.onVisibilityChange) {
+        document.removeEventListener(
+          'visibilitychange',
+          this.onVisibilityChange,
+        );
+        this.onVisibilityChange = null;
       }
       this.sidePanel?.classList.remove('ssq-active');
       this.sidePanel?.querySelectorAll('.ssq-tabbar').forEach((el) => el.remove());
