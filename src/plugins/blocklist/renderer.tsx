@@ -75,9 +75,70 @@ const shouldSkip = (author?: string | null, videoId?: string | null) => {
   return true;
 };
 
+type LikeButtonElement = HTMLElement & {
+  updateLikeStatus?: (status: string) => void;
+};
+
+const LIKE_STATUS_ATTRIBUTE = 'like-status';
+const DISLIKE_POLL_MS = 100;
+const DISLIKE_TIMEOUT_MS = 2000;
+// Extra grace period once the player reports the new track, so the like button
+// has time to switch over from the previous track's state.
+const DISLIKE_SETTLE_MS = 300;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const getLikeButton = () =>
+  document.querySelector<LikeButtonElement>('#like-button-renderer');
+
+/**
+ * Dislike the track with the given id (no-op if it is already disliked).
+ * Waits for the player to actually be on that track first, so a stale like
+ * button can never cause the previous/next song to be disliked by mistake.
+ */
+const dislikeTrack = async (videoId: string) => {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < DISLIKE_TIMEOUT_MS) {
+    const button = getLikeButton();
+    const currentId = api?.getVideoData?.()?.video_id;
+    if (button?.updateLikeStatus && currentId === videoId) {
+      await sleep(DISLIKE_SETTLE_MS);
+
+      // Re-check after settling: the user may have moved on in the meantime.
+      if (api?.getVideoData?.()?.video_id !== videoId) return;
+      if (button.getAttribute(LIKE_STATUS_ATTRIBUTE) === 'DISLIKE') return;
+
+      button.updateLikeStatus('DISLIKE');
+      return;
+    }
+    await sleep(DISLIKE_POLL_MS);
+  }
+};
+
+const dislikeThenSkip = async (videoId?: string | null) => {
+  const playerApi = api;
+  if (!playerApi) return;
+
+  if (videoId) {
+    try {
+      await dislikeTrack(videoId);
+    } catch (error) {
+      console.error('[blocklist] failed to dislike track', error);
+    }
+  }
+
+  // Don't skip twice if the plugin was stopped or the user already moved on
+  // while we were waiting.
+  if (api !== playerApi) return;
+  const currentId = playerApi.getVideoData?.()?.video_id;
+  if (videoId && currentId && currentId !== videoId) return;
+
+  playerApi.nextVideo();
+};
+
 const skipIfBlocked = (author?: string | null, videoId?: string | null) => {
   if (shouldSkip(author, videoId)) {
-    api?.nextVideo();
+    void dislikeThenSkip(videoId);
     return true;
   }
   return false;
